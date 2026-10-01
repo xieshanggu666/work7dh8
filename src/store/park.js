@@ -55,6 +55,13 @@ function emptyGroupStats() {
   }
 }
 
+function emptyIncidentStats() {
+  return {
+    open: 0, bySeverity: { 1: 0, 2: 0, 3: 0, 4: 0 }, overdue: 0, pendingClaims: 0,
+    claimPayToday: 0, costToday: 0, closedToday: 0, totalCost: 0, totalClaimPaid: 0, avgRating: 0
+  }
+}
+
 export const useParkStore = defineStore('park', {
   state: () => ({
     data: null,
@@ -108,7 +115,12 @@ export const useParkStore = defineStore('park', {
     groupConfig: s => s.data?.groupConfig || { enabled: 1, depositRate: 0.3, minQty: 5, maxQty: 120, days: 3, entryHours: [9, 10, 11, 12, 13, 14, 15, 16, 17, 18], rideHours: [9, 10, 11, 12, 13, 14, 15, 16, 17] },
     // 统一客流预测与资源调度闭环
     closedLoop: s => s.data?.closedLoop || { days: [], forecast: { factor: 1, days: [] }, reconcile: { open: 0, blocks: 0 } },
-    reconcileList: s => s.data?.reconcileList || []
+    reconcileList: s => s.data?.reconcileList || [],
+    // 园区应急指挥
+    incidents: s => s.data?.incidents || [],
+    incidentStats: s => s.data?.incidentStats || emptyIncidentStats(),
+    emergencyConst: s => s.data?.emergencyConst || { severityNames: {}, controlSla: {}, rescueCost: {}, staffSubsidy: {}, types: {} },
+    activeIncidents: s => (s.data?.incidents || []).filter(i => ['reported', 'graded', 'contained', 'evacuating', 'controlled'].includes(i.status))
   },
   actions: {
     async refresh() {
@@ -207,6 +219,26 @@ export const useParkStore = defineStore('park', {
     // 统一客流预测与资源调度闭环
     async closedLoop(horizon = 3) { return j('GET', `/closed-loop?horizon=${horizon}`) },
     runReconcile(autoHeal = true) { return this.api('POST', '/reconcile/run', { auto_heal: autoHeal }) },
-    ignoreReconcile(id) { return this.api('POST', `/reconcile/${id}/ignore`, {}) }
+    ignoreReconcile(id) { return this.api('POST', `/reconcile/${id}/ignore`, {}) },
+    // 园区应急指挥：发现 / 分级 / 封控 / 疏散 / 控场 / 复园 / 复盘
+    reportIncident(payload) { return this.api('POST', '/incidents', payload) },
+    gradeIncident(id, payload) { return this.api('POST', `/incidents/${id}/grade`, payload) },
+    lockdownIncident(id, payload) { return this.api('POST', `/incidents/${id}/lockdown`, payload) },
+    startEvacuation(id, payload) { return this.api('POST', `/incidents/${id}/evacuate`, payload) },
+    reportEvacuation(id, qty, staffId) { return this.api('POST', `/incidents/${id}/evacuate/progress`, { qty, staff_id: staffId, request_id: newRequestId() }) },
+    controlIncident(id, payload) { return this.api('POST', `/incidents/${id}/control`, payload) },
+    reopenIncident(id, payload) { return this.api('POST', `/incidents/${id}/reopen`, payload) },
+    reviewIncident(id, payload) { return this.api('POST', `/incidents/${id}/review`, payload) },
+    closeFalseIncident(id, payload) { return this.api('POST', `/incidents/${id}/false`, payload) },
+    escalateIncidentFromComplaint(complaintId) { return this.api('POST', `/complaints/${complaintId}/escalate-incident`, { request_id: newRequestId() }) },
+    assignIncidentStaff(id, staff_id, task_type, operator_id) {
+      return this.api('POST', `/incidents/${id}/staff`, { staff_id, task_type, operator_id, request_id: newRequestId() })
+    },
+    acknowledgeIncidentStaff(linkId) { return this.api('POST', `/incident-staff/${linkId}/acknowledge`, { request_id: newRequestId() }) },
+    standDownIncidentStaff(linkId) { return this.api('POST', `/incident-staff/${linkId}/stand-down`, { request_id: newRequestId() }) },
+    fileIncidentClaim(id, payload) { return this.api('POST', `/incidents/${id}/claims`, payload) },
+    payIncidentClaim(claimId, payload) { return this.api('POST', `/incident-claims/${claimId}/pay`, payload) },
+    rejectIncidentClaim(claimId, payload) { return this.api('POST', `/incident-claims/${claimId}/reject`, payload) },
+    async incidentDetail(id) { return j('GET', `/incidents/${id}`) }
   }
 })

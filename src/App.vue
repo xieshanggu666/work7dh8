@@ -14,6 +14,7 @@ import ReservationsView from '@/components/ReservationsView.vue'
 import GroupsView from '@/components/GroupsView.vue'
 import EventsView from '@/components/EventsView.vue'
 import ComplaintsView from '@/components/ComplaintsView.vue'
+import EmergencyView from '@/components/EmergencyView.vue'
 import ReportsView from '@/components/ReportsView.vue'
 
 const store = useParkStore()
@@ -33,6 +34,7 @@ const navs = [
   { k: 'groups', icon: '🧑‍✈️', label: '领队组团' },
   { k: 'events', icon: '🎆', label: '活动事件' },
   { k: 'complaints', icon: '🗂️', label: '投诉补救' },
+  { k: 'emergency', icon: '🚨', label: '应急指挥' },
   { k: 'reports', icon: '📈', label: '经营报表' }
 ]
 
@@ -76,6 +78,8 @@ onMounted(store.refresh)
           <span class="halo" v-if="store.reservationStats.oversoldPending">⚠️ {{ store.reservationStats.oversoldPending }} 个超售时段待消化</span>
           <span class="halo" v-if="store.groupStats.pending">🧑‍✈️ {{ store.groupStats.pending }} 个团队待确认</span>
           <span class="halo red" v-if="store.groupStats.interrupted">🚧 {{ store.groupStats.interrupted }} 段团队行程停运待处置</span>
+          <span class="halo red" v-if="store.incidentStats.open">🚨 {{ store.incidentStats.open }} 起安全事件应急中</span>
+          <span class="halo" v-if="store.incidentStats.pendingClaims">🩹 {{ store.incidentStats.pendingClaims }} 笔游客理赔待核定</span>
           <span class="halo" v-if="store.memberStats.expiring">💳 {{ store.memberStats.expiring }} 张会员卡即将到期</span>
         </div>
         <div class="stats">
@@ -100,6 +104,7 @@ onMounted(store.refresh)
         <GroupsView v-else-if="view === 'groups'" />
         <EventsView v-else-if="view === 'events'" />
         <ComplaintsView v-else-if="view === 'complaints'" />
+        <EmergencyView v-else-if="view === 'emergency'" />
         <ReportsView v-else />
       </section>
     </main>

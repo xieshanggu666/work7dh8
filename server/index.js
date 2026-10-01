@@ -42,6 +42,15 @@ import {
   initFlowContext, refreshForecastSnapshots, settleForecastLearning,
   runReconcile, listFindings, ignoreFinding, closedLoopOverview, reconcileStats
 } from './flow.js'
+import {
+  initEmergencyContext, reportIncident, gradeIncident, lockdownIncident,
+  startEvacuation, reportEvacuation, controlIncident, reopenIncident, reviewIncident,
+  closeFalseIncident, assignIncidentStaff, acknowledgeStaff, standDownStaff,
+  fileClaim, payClaim, rejectClaim, escalateFromComplaint, processIncidents,
+  maybeSpawnIncident, activeCrowdFactor, listIncidents, incidentDetail, incidentStats,
+  EMERGENCY_CONST
+} from './emergency.js'
+import { emergencyCloseEntrySlots, emergencyReopenEntrySlots } from './reservations.js'
 import { initRideContext, upgradeRide } from './rides.js'
 
 const app = express()
@@ -133,7 +142,9 @@ initGroupContext({
 })
 // 预约停运联动 → 团行程重排/退款（同一事务内执行）
 initReservationContext({
-  handleParkOutageGroup: (rows, info) => handleParkOutageGroupRows(rows, info)
+  handleParkOutageGroup: (rows, info) => handleParkOutageGroupRows(rows, info),
+  // 全园封控（特别重大安全事件未复园）：新生成的未来入园时段默认关闭，防止封控期被下单
+  isParkClosed: () => db.prepare("SELECT COUNT(*) n FROM incidents WHERE severity=4 AND status IN ('graded','contained','evacuating','controlled')").get().n > 0
 })
 
 // 统一客流预测与资源调度闭环：库存/团单在事务提交后刷新统一预测快照，并按动态模式触发调度重排
@@ -142,6 +153,19 @@ initFlowContext({
 })
 // 启动即生成首版未来三天统一预测快照（闭环看板/排班需求画像的事实源）
 try { refreshForecastSnapshots() } catch (e) { console.error('[flow] 初始预测快照失败:', e) }
+
+// 园区应急指挥：安全事件 发现→分级→封控→疏散→复园→复盘
+// 复用设施停运/预约退款联动、投诉建单与闭环、排班在岗校验与应急岗位动态调度、财务流水
+initEmergencyContext({
+  logFinance,
+  syncRideSlots: (ride) => syncRideSlots(ride),
+  closeEntrySlots: () => emergencyCloseEntrySlots(),
+  reopenEntrySlots: () => emergencyReopenEntrySlots(),
+  createComplaint: (payload) => createComplaint(payload),
+  closeComplaintLinked: (cid, inc, kind, meta) => closeLinkedComplaint(cid, inc, kind, meta),
+  staffDutyState: (staffId) => staffDutyState(staffId),
+  dispatchAfter: (reason) => { try { maybeDispatchAfter(reason) } catch { /* 调度失败不阻塞应急流程 */ } }
+})
 
 // ---------------- 分期贷款 ----------------
 const activeLoans = () => db.prepare("SELECT * FROM loans WHERE status='active' ORDER BY id").all()
@@ -488,6 +512,34 @@ function forceCloseComplaint(id) {
   return { ok: true }
 }
 
+// 应急模块联动：事件复盘/误报关闭、理赔赔付/驳回时，把关联安全投诉做无争议闭环
+// kind: event_review 事件复盘（正向关闭，不补偿现金，补偿已在理赔/应急侧完成）/
+//       event_false 误报关闭 / claim_paid 理赔已赔付（视同现金补偿结案）/ claim_rejected 理赔驳回
+function closeLinkedComplaint(cid, inc, kind = 'event_review', meta = {}) {
+  if (!cid) return
+  const c = db.prepare('SELECT * FROM complaints WHERE id=?').get(cid)
+  if (!c || !OPEN_COMPLAINT_STATUSES.includes(c.status)) return
+  if (kind === 'claim_paid') {
+    db.prepare(`UPDATE complaints SET status='closed_resolved', compensation='cash', comp_cost=?,
+                rating=4, close_reason=?, closed_tick=?, closed_day=? WHERE id=?`)
+      .run(meta.amount || 0, `安全事件理赔 ${meta.claimCode || ''} 已现金赔付，投诉随事件处置闭环`, state.tick(), state.day(), cid)
+    logComplaint(cid, 'resolve', `关联安全事件理赔 ${meta.claimCode || ''} 已赔付 ¥${meta.amount || 0}，投诉闭环`)
+  } else if (kind === 'event_review') {
+    db.prepare(`UPDATE complaints SET status='closed_resolved', compensation='apology', comp_cost=0,
+                rating=4, close_reason=?, closed_tick=?, closed_day=? WHERE id=?`)
+      .run('关联安全事件已完成应急处置并复盘结案，现场安全已恢复', state.tick(), state.day(), cid)
+    logComplaint(cid, 'resolve', `关联安全事件 ${inc?.code || ''} 复盘结案，投诉随应急处置闭环`)
+  } else {
+    // 误报关闭 / 理赔驳回：园方已核实处置，做中性结案（不触发差评）
+    const reason = kind === 'claim_rejected'
+      ? `理赔 ${meta.claimCode || ''} 经核定不符合赔付范围${meta.note ? `：${meta.note}` : ''}，现场已处置`
+      : '关联安全事件经核实为误报，现场无安全隐患'
+    db.prepare(`UPDATE complaints SET status='closed_force', close_reason=?, closed_tick=?, closed_day=? WHERE id=?`)
+      .run(reason, state.tick(), state.day(), cid)
+    logComplaint(cid, 'force', reason)
+  }
+}
+
 // 检修完工联动：维修工在现场可一并处置针对该设施的「设施故障」投诉
 // 待受理的同设施设施类投诉由其接手并记 40% 处置进度；已由其本人推进的直接完成现场处置待补偿
 function linkComplaintsToRide(rideId, staffId) {
@@ -641,8 +693,10 @@ function tick() {
   const zoneFactor = 1
   // 投诉补救口碑回流：每点口碑约影响 ±1.2% 客流
   const complaintFactor = Math.max(0.7, 1 + state.wordOfMouth() * 0.012)
+  // 在途安全事件按最高等级折减散客客流（封控/疏散期间游客避险、到访下降）
+  const emergencyFactor = activeCrowdFactor()
   // 分时预约已锁定部分客流：散客 = 自然需求；总入园 = 散客 + 预约核销到场
-  const walkIn = Math.round(base * retail * priceFactor * repFactor * zoneFactor * complaintFactor * (0.85 + Math.random() * 0.3))
+  const walkIn = Math.round(base * retail * priceFactor * repFactor * zoneFactor * complaintFactor * emergencyFactor * (0.85 + Math.random() * 0.3))
   const entering = walkIn + reservedEntry
   const satisfaction = computeSatisfaction(reservedEntry, entering)
   // 游客反馈：运营状况驱动随机投诉
@@ -746,9 +800,16 @@ function tick() {
   // 设施检修工单：维修员工接单后按游戏时间推进，离岗退回排队，完工恢复运营并结算费用
   processMaintenance()
 
-  // 声誉演化：满意度+事件+预算健康度+超时投诉
+  // 园区应急指挥：上报后久未分级自动核定、超封控时限未控场自动升级（返回声誉扣分）
+  const emergencyPenalty = processIncidents()
+  // 在途重大事件持续侵蚀声誉（游客对园区安全失去信心）
+  const severeOpen = db.prepare(`SELECT COUNT(*) n FROM incidents
+    WHERE status IN ('graded','contained','evacuating','controlled') AND severity>=3`).get().n
+  const emergencyDrag = severeOpen * 0.8 + (emergencyPenalty || 0)
+
+  // 声誉演化：满意度+事件+预算健康度+超时投诉+在途安全事件
   const budgetHealth = cash > 0 ? Math.min(1, cash / 200000) : -0.4
-  rep = Math.max(5, Math.min(100, rep + (satisfaction - 70) * 0.15 + budgetHealth * 2 + eventRepShift - complaintPenalty))
+  rep = Math.max(5, Math.min(100, rep + (satisfaction - 70) * 0.15 + budgetHealth * 2 + eventRepShift - complaintPenalty - emergencyDrag))
 
   // 贷款逾期：信用受损（本次日结新产生的逾期，每条 -1.5 声誉）
   if (overdueHits > 0) {
@@ -777,6 +838,18 @@ function tick() {
   maybeSpawnEvent(day)
 
   checkBrokenDown(day)
+
+  // 园区应急指挥：低频模拟巡报安全事件（安保巡报，进入待分级）
+  if (hour >= OPEN_HOUR && hour <= OPEN_HOUR + HOURS_PER_DAY - 1) {
+    try {
+      const spawned = maybeSpawnIncident()
+      if (spawned?.ok) {
+        db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+          .run(tickCount, day, 'emergency', '安保巡报安全事件',
+            `应急指挥中心收到一条安全事件巡报（${spawned.code}），请运营值班主管立即核实并分级，组织封控与疏散。`, -2, 'active')
+      }
+    } catch (e) { console.error('[emergency] 模拟事件生成失败:', e) }
+  }
 
   // 统一客流预测与资源调度闭环：每小时刷新未来三天预测快照（库存/团单变化后统一口径）
   try { refreshForecastSnapshots() } catch (e) { console.error('[flow] 预测快照刷新失败:', e) }
@@ -809,6 +882,10 @@ function computeSatisfaction(reserved = 0, total = 0) {
   // 未结投诉持续拉低满意度（按严重度，上限 15），服务口碑小幅回流
   const drag = db.prepare("SELECT COALESCE(SUM(severity),0) s FROM complaints WHERE status IN ('open','processing','ready')").get().s
   sat -= Math.min(15, drag * 0.8)
+  // 在途安全事件：封控/疏散期间现场游客体验显著下降（按最高等级，上限 18）
+  const incRow = db.prepare(`SELECT MAX(severity) s, COUNT(*) n FROM incidents
+    WHERE status IN ('graded','contained','evacuating','controlled') AND severity>=1`).get()
+  if (incRow.s) sat -= Math.min(18, incRow.s * 4 + Math.min(6, incRow.n * 2))
   sat += Math.max(-10, Math.min(10, state.wordOfMouth())) * 0.5
   sat += state.reputation() * 0.2
   // 分时预约核销占比越高，入园/排队越有序，满意度小幅加成（上限 +4）
@@ -937,6 +1014,16 @@ app.get('/api/state', (req, res) => {
     // 统一客流预测与资源调度闭环（统一预测 + 缺口画像 + 一致性巡检）
     closedLoop: closedLoopOverview({ horizon: 3, demandProvider: d => demandForDay(d) }),
     reconcileList: listFindings({ status: 'open', limit: 50 }),
+    // 园区应急指挥：安全事件状态机与统计（在途事件置前）
+    incidents: listIncidents({ limit: 80 }),
+    incidentStats: incidentStats(),
+    emergencyConst: {
+      severityNames: EMERGENCY_CONST.SEVERITY_NAMES,
+      controlSla: EMERGENCY_CONST.CONTROL_SLA,
+      rescueCost: EMERGENCY_CONST.RESCUE_COST,
+      staffSubsidy: EMERGENCY_CONST.STAFF_SUBSIDY,
+      types: Object.fromEntries(Object.entries(EMERGENCY_CONST.TYPES).map(([k, v]) => [k, { name: v.name, icon: v.icon, defSev: v.defSev }]))
+    },
     finance: fin,
     avgs: {
       satisfaction: computeSatisfaction(),
@@ -1873,6 +1960,186 @@ app.post('/api/member-config', (req, res) => {
 // 卡种运营配置（价格/有效期/折扣/赠送/上下架）
 app.post('/api/card-products/:tier', (req, res) => {
   reply(req, res, updateCardProduct(String(req.params.tier), req.body || {}))
+})
+
+// ---------------- 园区应急指挥：安全事件 发现→分级→封控→疏散→复园→复盘 ----------------
+// 多角色协作：运营（分级/封控/复园/复盘/核定理赔）、安保（疏散上报/到场/撤防）、游客（上报/理赔）
+app.get('/api/incidents', (req, res) => {
+  const q = req.query || {}
+  res.json({
+    list: listIncidents({ status: q.status || null, limit: 100 }),
+    stats: incidentStats(),
+    const: EMERGENCY_CONST
+  })
+})
+
+app.get('/api/incidents/:id', (req, res) => {
+  const d = incidentDetail(num(req.params.id))
+  if (!d) return res.status(404).json({ ok: false, msg: '事件不存在' })
+  res.json(d)
+})
+
+// 发现上报（运营/安保巡报/游客）；游客上报自动联动安全投诉
+app.post('/api/incidents', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, reportIncident({
+    type: String(b.type || 'other'),
+    title: String(b.title || ''),
+    desc: String(b.desc || ''),
+    location: String(b.location || ''),
+    zoneId: b.zone_id ? num(b.zone_id) : null,
+    reporterRole: ['operations', 'security', 'visitor'].includes(b.reporter_role) ? b.reporter_role : 'security',
+    source: b.source === 'auto' ? 'auto' : '',
+    complaintId: b.complaint_id ? num(b.complaint_id) : null,
+    staffId: b.staff_id ? num(b.staff_id) : null,
+    requestId: idemKey(req)
+  }), 201)
+})
+
+// 分级（可同时封控指定设施/区域；4 级全园封控）→ graded/contained
+app.post('/api/incidents/:id/grade', (req, res) => {
+  const b = req.body || {}
+  const lockdown = b.lockdown || {}
+  reply(req, res, gradeIncident(num(req.params.id), {
+    severity: num(b.severity),
+    lockdown: {
+      rides: Array.isArray(lockdown.rides) ? lockdown.rides.map(num) : [],
+      zones: Array.isArray(lockdown.zones) ? lockdown.zones.map(num) : [],
+      parkWide: !!lockdown.park_wide,
+      autoZone: lockdown.auto_zone === false ? false : true
+    },
+    staffId: b.staff_id ? num(b.staff_id) : null,
+    requestId: idemKey(req)
+  }))
+})
+
+// 对已分级事件追加封控对象 → contained
+app.post('/api/incidents/:id/lockdown', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, lockdownIncident(num(req.params.id), {
+    rides: Array.isArray(b.rides) ? b.rides.map(num) : [],
+    zones: Array.isArray(b.zones) ? b.zones.map(num) : [],
+    parkWide: !!b.park_wide,
+    staffId: b.staff_id ? num(b.staff_id) : null,
+    requestId: idemKey(req)
+  }))
+})
+
+// 启动疏散（contained/graded → evacuating），首批疏散人数
+app.post('/api/incidents/:id/evacuate', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, startEvacuation(num(req.params.id), {
+    qty: num(b.qty), staffId: b.staff_id ? num(b.staff_id) : null, requestId: idemKey(req)
+  }))
+})
+
+// 安保现场上报疏散进展（增量）
+app.post('/api/incidents/:id/evacuate/progress', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, reportEvacuation(num(req.params.id), {
+    qty: num(b.qty), staffId: b.staff_id ? num(b.staff_id) : null, requestId: idemKey(req)
+  }))
+})
+
+// 控场（险情控制，核定伤员）→ controlled
+app.post('/api/incidents/:id/control', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, controlIncident(num(req.params.id), {
+    casualties: num(b.casualties), staffId: b.staff_id ? num(b.staff_id) : null, requestId: idemKey(req)
+  }))
+})
+
+// 复园：恢复封控对象/时段/区域，结算抢险费用与应急补贴 → reopened
+app.post('/api/incidents/:id/reopen', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, reopenIncident(num(req.params.id), {
+    cost: b.cost != null ? num(b.cost) : null,
+    staffId: b.staff_id ? num(b.staff_id) : null,
+    requestId: idemKey(req)
+  }))
+})
+
+// 事故复盘结案（原因/措施/教训/评分，声誉回补）→ closed_review
+app.post('/api/incidents/:id/review', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, reviewIncident(num(req.params.id), {
+    cause: String(b.cause || ''),
+    actions: String(b.actions || ''),
+    lessons: String(b.lessons || ''),
+    rating: num(b.rating, 3),
+    staffId: b.staff_id ? num(b.staff_id) : null,
+    requestId: idemKey(req)
+  }))
+})
+
+// 误报关闭（恢复封控对象，不计抢险费用）→ closed_false
+app.post('/api/incidents/:id/false', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, closeFalseIncident(num(req.params.id), {
+    reason: String(b.reason || ''),
+    staffId: b.staff_id ? num(b.staff_id) : null,
+    requestId: idemKey(req)
+  }))
+})
+
+// 安全投诉转报为安全事件
+app.post('/api/complaints/:id/escalate-incident', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, escalateFromComplaint(num(req.params.id), {
+    staffId: b.staff_id ? num(b.staff_id) : null, requestId: idemKey(req)
+  }), 201)
+})
+
+// ---- 应急岗位调度（安保协作） ----
+app.post('/api/incidents/:id/staff', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, assignIncidentStaff(num(req.params.id), {
+    staffId: num(b.staff_id),
+    taskType: String(b.task_type || 'control'),
+    note: String(b.note || ''),
+    operatorId: b.operator_id ? num(b.operator_id) : null,
+    requestId: idemKey(req)
+  }))
+})
+
+app.post('/api/incident-staff/:id/acknowledge', (req, res) => {
+  reply(req, res, acknowledgeStaff(num(req.params.id), { requestId: idemKey(req) }))
+})
+
+app.post('/api/incident-staff/:id/stand-down', (req, res) => {
+  reply(req, res, standDownStaff(num(req.params.id), { requestId: idemKey(req) }))
+})
+
+// ---- 游客理赔（财务补偿联动） ----
+app.post('/api/incidents/:id/claims', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, fileClaim(num(req.params.id), {
+    guestName: String(b.guest_name || ''),
+    guestPhone: String(b.guest_phone || ''),
+    memberId: b.member_id ? num(b.member_id) : null,
+    item: String(b.item || ''),
+    amountReq: num(b.amount_req),
+    requestId: idemKey(req)
+  }), 201)
+})
+
+app.post('/api/incident-claims/:id/pay', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, payClaim(num(req.params.id), {
+    amount: b.amount != null ? num(b.amount) : null,
+    note: String(b.note || ''),
+    handlerId: b.handler_id ? num(b.handler_id) : null,
+    requestId: idemKey(req)
+  }))
+})
+
+app.post('/api/incident-claims/:id/reject', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, rejectClaim(num(req.params.id), {
+    note: String(b.note || ''),
+    handlerId: b.handler_id ? num(b.handler_id) : null,
+    requestId: idemKey(req)
+  }))
 })
 
 // 全局异常兜底：未捕获错误统一返回可追踪的 500（请求号写入服务端日志）

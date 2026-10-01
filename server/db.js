@@ -691,6 +691,109 @@ CREATE TABLE IF NOT EXISTS dispatch_plan_items (
 );
 CREATE INDEX IF NOT EXISTS idx_dpitem_plan ON dispatch_plan_items(plan_id,seq);
 CREATE INDEX IF NOT EXISTS idx_dpitem_status ON dispatch_plan_items(status,kind);
+
+-- ========== 园区应急指挥：安全事件 发现→分级→封控→疏散→复园 状态机 ==========
+CREATE TABLE IF NOT EXISTS incidents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',            -- EM0001
+  type TEXT NOT NULL,                       -- fire/facility/crowd/food/medical/weather/security/power/missing/other
+  title TEXT NOT NULL,
+  desc TEXT NOT NULL DEFAULT '',
+  location TEXT NOT NULL DEFAULT '',        -- 事发地点文字描述
+  zone_id INTEGER,                          -- 事发区域
+  severity INTEGER NOT NULL DEFAULT 0,      -- 0 待分级 / 1 一般 / 2 较大 / 3 重大 / 4 特别重大
+  status TEXT NOT NULL DEFAULT 'reported',  -- reported/graded/contained/evacuating/controlled/reopened/closed_review/closed_false
+  source TEXT NOT NULL DEFAULT 'patrol',    -- patrol 安保巡报 / visitor 游客上报 / ops 运营发现 / auto 模拟 / complaint 投诉转报
+  reporter_role TEXT NOT NULL DEFAULT 'security', -- operations / security / visitor
+  casualties INTEGER NOT NULL DEFAULT 0,    -- 受伤人数（控场时核定）
+  evacuated_qty INTEGER NOT NULL DEFAULT 0, -- 已疏散人数
+  refund_ride_qty INTEGER NOT NULL DEFAULT 0,  -- 封控停运设施联动退款人数
+  refund_entry_qty INTEGER NOT NULL DEFAULT 0, -- 区域封控关停入园预约影响人数
+  subsidy_total INTEGER NOT NULL DEFAULT 0, -- 应急岗位调度补贴合计（复园时结算）
+  rescue_cost INTEGER NOT NULL DEFAULT 0,   -- 应急抢险费用（复园时结算）
+  control_deadline_tick INTEGER NOT NULL DEFAULT 0, -- 分级后完成封控的处置时限
+  contained_tick INTEGER NOT NULL DEFAULT 0,
+  reopened_tick INTEGER NOT NULL DEFAULT 0,
+  reopened_day INTEGER NOT NULL DEFAULT 0,
+  closed_tick INTEGER NOT NULL DEFAULT 0,
+  closed_day INTEGER NOT NULL DEFAULT 0,
+  close_reason TEXT NOT NULL DEFAULT '',
+  review_cause TEXT NOT NULL DEFAULT '',    -- 事故原因
+  review_actions TEXT NOT NULL DEFAULT '',  -- 整改措施
+  review_lessons TEXT NOT NULL DEFAULT '',  -- 经验教训
+  review_rating INTEGER NOT NULL DEFAULT 0, -- 复盘评分 1-5（处置质量）
+  review_rep_recover INTEGER NOT NULL DEFAULT 0, -- 复盘声誉回补
+  complaint_id INTEGER,                     -- 投诉转报来源 / 游客理赔关联投诉
+  create_tick INTEGER NOT NULL DEFAULT 0,
+  create_day INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(status);
+CREATE INDEX IF NOT EXISTS idx_incidents_sev ON incidents(severity,status);
+
+-- 事件全生命周期时间线：上报/分级/封控（设施停运·区域封锁）/疏散/控场/复园/复盘/误报关闭
+CREATE TABLE IF NOT EXISTS incident_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  incident_id INTEGER NOT NULL,
+  tick INTEGER NOT NULL,
+  day INTEGER NOT NULL,
+  hour INTEGER NOT NULL,
+  action TEXT NOT NULL,   -- report/grade/lockdown/evacuate/control/reopen/review/false/escalate/claim/...
+  note TEXT NOT NULL DEFAULT '',
+  staff_id INTEGER,
+  actor_role TEXT NOT NULL DEFAULT 'operations' -- operations/security/visitor/system
+);
+CREATE INDEX IF NOT EXISTS idx_incident_logs_iid ON incident_logs(incident_id);
+
+-- 封控对象：事件封控时联动停运的设施 / 封锁的区域，复园（或误报关闭）时按原状态恢复
+CREATE TABLE IF NOT EXISTS incident_targets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  incident_id INTEGER NOT NULL,
+  target_type TEXT NOT NULL,                -- ride / zone
+  target_id INTEGER NOT NULL,
+  prev_status TEXT NOT NULL DEFAULT '',     -- 封控前状态（operating/maintenance；区域恒 1）
+  locked_tick INTEGER NOT NULL DEFAULT 0,
+  restored_tick INTEGER NOT NULL DEFAULT 0, -- 0 表示尚未复园恢复
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_incident_targets_inc ON incident_targets(incident_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_incident_targets_one ON incident_targets(incident_id,target_type,target_id) WHERE restored_tick=0;
+
+-- 应急岗位调度：事件响应调派的员工（安保为主，可含保洁/维修），到场确认/撤防，复园时按岗位补贴结算
+CREATE TABLE IF NOT EXISTS incident_staff (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  incident_id INTEGER NOT NULL,
+  staff_id INTEGER NOT NULL,
+  task_type TEXT NOT NULL DEFAULT 'control', -- control 封控警戒 / evacuate 疏散引导 / rescue 抢险救援 / medical 医疗救护
+  status TEXT NOT NULL DEFAULT 'assigned',  -- assigned 已调派 / acknowledged 已到场 / stood_down 已撤防
+  subsidy INTEGER NOT NULL DEFAULT 0,       -- 复园结算的应急补贴（元）
+  assign_tick INTEGER NOT NULL DEFAULT 0,
+  ack_tick INTEGER NOT NULL DEFAULT 0,
+  stand_tick INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_incident_staff_inc ON incident_staff(incident_id,status);
+
+-- 游客理赔：游客就安全事件登记损失，运营核定后现金赔付（财务补偿），关联投诉自动闭环
+CREATE TABLE IF NOT EXISTS incident_claims (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  incident_id INTEGER NOT NULL,
+  code TEXT NOT NULL DEFAULT '',            -- CL0001
+  guest_name TEXT NOT NULL DEFAULT '游客',
+  guest_phone TEXT NOT NULL DEFAULT '',
+  member_id INTEGER,
+  item TEXT NOT NULL DEFAULT '',            -- 理赔事项（医疗/财物/门票损失…）
+  amount_req INTEGER NOT NULL DEFAULT 0,    -- 游客申请金额
+  amount_pay INTEGER NOT NULL DEFAULT 0,    -- 核定赔付金额
+  status TEXT NOT NULL DEFAULT 'submitted', -- submitted 待核定 / paid 已赔付 / rejected 已驳回 / withdrawn 已撤回
+  complaint_id INTEGER,                     -- 登记时自动生成的安全投诉
+  note TEXT NOT NULL DEFAULT '',
+  handler_id INTEGER,
+  create_tick INTEGER NOT NULL DEFAULT 0,
+  create_day INTEGER NOT NULL DEFAULT 0,
+  handle_tick INTEGER NOT NULL DEFAULT 0,
+  handle_day INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_incident_claims_inc ON incident_claims(incident_id,status);
 `)
 
 // ---------- 轻量列迁移（兼容老库） ----------

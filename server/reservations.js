@@ -84,7 +84,9 @@ const ctx = {
   // 会员联动：报价（折扣/免票券/快速通行券）、建单后（核销权益+发积分）、退款后（返还权益+回退积分）
   quoteReservation: null,
   onReservationBooked: null,
-  onReservationRefunded: null
+  onReservationRefunded: null,
+  // 园区应急：是否处于全园封控（特别重大安全事件）；为 true 时新生成的入园时段默认关闭
+  isParkClosed: null
 }
 export function initReservationContext(deps) {
   Object.assign(ctx, deps)
@@ -129,7 +131,14 @@ export function ensureSlots() {
                                  VALUES('ride',?,?,?,?,?,?)`)
   for (let d = 0; d < GENERATE_DAYS; d++) {
     const day = today + d
-    for (const h of ENTRY_HOURS) insertEntry.run(day, h, DEFAULT_ENTRY_CAP, DEFAULT_ENTRY_OVERSELL)
+    for (const h of ENTRY_HOURS) {
+      insertEntry.run(day, h, DEFAULT_ENTRY_CAP, DEFAULT_ENTRY_OVERSELL)
+      // 全园封控期间（特别重大安全事件未复园）：新生成/未来入园时段保持关闭，防止封控期被下单
+      if (d > 0 && ctx.isParkClosed?.()) {
+        db.prepare("UPDATE reservation_slots SET status='closed' WHERE scope='entry' AND day=? AND hour=?")
+          .run(day, h)
+      }
+    }
     for (const r of rideIds) {
       for (const h of RIDE_HOURS) {
         insertRide.run(r.id, day, h, DEFAULT_RIDE_CAP, 0, r.status === 'operating' ? 'open' : 'closed')
@@ -890,6 +899,43 @@ export function reservationStats() {
 }
 
 export const RESERVATION_CONST = { OPEN_HOUR, ENTRY_HOURS, RIDE_HOURS, GENERATE_DAYS, DEFAULT_ENTRY_CAP, DEFAULT_RIDE_CAP }
+
+// 全园封控（特别重大安全事件）：关停全部未来入园时段，在途入园预约园方全额退款；
+// 团入园行程交团模块同事务重排/退款，散客预约自动生成投诉。返回退款人数。
+// 不自建事务：在调用方（应急模块封控事务）内执行，任一步失败抛错由外层整体回滚。
+export function emergencyCloseEntrySlots(note = '园区安全事件，全园临时封控') {
+  db.prepare("UPDATE reservation_slots SET status='closed' WHERE scope='entry' AND day>=?")
+    .run(ctx.day())
+  const pendingAll = db.prepare(`SELECT * FROM reservations WHERE scope='entry' AND status='booked'
+                AND (slot_day>? OR (slot_day=? AND slot_hour>=?))`).all(ctx.day(), ctx.day(), ctx.hour())
+  const groupRows = pendingAll.filter(r => r.source === 'group' && r.group_item_id)
+  const guestRows = pendingAll.filter(r => !(r.source === 'group' && r.group_item_id))
+  if (groupRows.length && ctx.handleParkOutageGroup) {
+    ctx.handleParkOutageGroup(groupRows, { type: 'entry', ride: null, reason: 'emergency' })
+  }
+  let qty = 0
+  for (const r of groupRows) qty += r.qty
+  forceRefundByPark(
+    guestRows,
+    note,
+    {
+      category: 'safety',
+      severity: 3,
+      title: '全园封控 · 入园预约取消',
+      content: '园区因安全事件临时封控，您的入园预约已被园方取消，虽已全额退款，但行程受到影响。',
+      skipComplaint: groupRows.length > 0
+    }
+  )
+  for (const r of guestRows) qty += r.qty
+  return qty
+}
+
+// 复园：重新开放未来入园时段（已退款预约不自动恢复，由运营另行处理）
+export function emergencyReopenEntrySlots() {
+  db.prepare("UPDATE reservation_slots SET status='open' WHERE scope='entry' AND day>=?")
+    .run(ctx.day())
+  return { ok: true }
+}
 
 // 领队组团模块复用：时段行查询（含余量）
 export function getSlotById(id) { return getSlot(num(id)) }

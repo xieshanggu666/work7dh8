@@ -65,6 +65,12 @@ function assign(c) {
   store.assignComplaint(c.id, sid)
 }
 function escalate(c) { store.escalateComplaint(c.id) }
+async function toEmergency(c) {
+  const r = await store.escalateIncidentFromComplaint(c.id)
+  if (r?.ok) emergencyMsg.value = `已转报为安全事件 ${r.code}，可在「应急指挥」页面分级处置`
+  else emergencyMsg.value = r?.msg || '转报失败'
+}
+const emergencyMsg = ref('')
 function resolveC(c) { store.resolveComplaint(c.id, compChoice.value[c.id] || 'apology') }
 function forceClose(c) { store.closeComplaint(c.id) }
 function compName(k) { return COMP_OPTIONS.find(o => o.k === k)?.name || '—' }
@@ -110,6 +116,7 @@ const womText = computed(() => `${wom.value > 0 ? '+' : ''}${wom.value.toFixed(1
 
 <template>
   <div class="cp">
+    <div class="flash" v-if="emergencyMsg">🚨 {{ emergencyMsg }}</div>
     <div class="stat-grid">
       <div class="card stat" :class="{ alert: stats.overdue }">
         <span>📮</span><b>{{ stats.open }}</b><em>待处置投诉</em>
@@ -198,6 +205,7 @@ const womText = computed(() => `${wom.value > 0 ? '+' : ''}${wom.value.toFixed(1
               <div class="actions">
                 <button v-if="c.status === 'open'" class="succ" :disabled="!assignees[c.id]" @click="assign(c)">受理</button>
                 <button v-if="c.status === 'ready'" class="succ" @click="resolveC(c)">确认补偿结案</button>
+                <button v-if="c.category === 'safety' && c.status !== 'closed_resolved' && c.status !== 'closed_timeout'" class="ghost" @click="toEmergency(c)">🚨 转报应急</button>
                 <button v-if="c.severity < 3" class="ghost" @click="escalate(c)">⬆ 升级{{ c.escalated ? `（${c.escalations}次）` : '' }}</button>
                 <button class="danger" @click="forceClose(c)">不予补偿结案</button>
               </div>
@@ -298,6 +306,7 @@ const womText = computed(() => `${wom.value > 0 ? '+' : ''}${wom.value.toFixed(1
 
 <style scoped>
 .cp { display: flex; flex-direction: column; gap: 16px; }
+.flash { background: rgba(255,107,107,.12); border: 1px solid rgba(255,107,107,.4); color: var(--red); padding: 8px 14px; border-radius: 10px; font-size: 13px; }
 .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; }
 .stat { display: flex; flex-direction: column; gap: 4px; }
 .stat span { font-size: 22px; }
