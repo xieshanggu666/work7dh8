@@ -79,6 +79,12 @@ const repLabels = Array.from({ length: Math.min(store.visitors.length, 12) }, (_
       <div class="card stat" :class="{ alert: store.memberStats.expiring }">
         <span>⏳</span><b :class="store.memberStats.expiring ? 'money neg' : ''">{{ store.memberStats.expiring }}</b><em>会员卡即将到期</em>
       </div>
+      <div class="card stat" :class="{ alert: store.emergencyStats.open }">
+        <span>🚨</span><b :class="store.emergencyStats.open ? 'money neg' : ''">{{ store.emergencyStats.open }}</b><em>安全事件处置中<span v-if="store.emergencyStats.injuredActive">（伤 {{ store.emergencyStats.injuredActive }}）</span></em>
+      </div>
+      <div class="card stat" :class="{ alert: store.emergencyStats.tasksPending }">
+        <span>🦺</span><b :class="store.emergencyStats.tasksPending ? 'money neg' : ''">{{ store.emergencyStats.tasksPending }}</b><em>应急任务进行中</em>
+      </div>
     </div>
 
     <div class="row">

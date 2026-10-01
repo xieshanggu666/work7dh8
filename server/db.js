@@ -691,6 +691,102 @@ CREATE TABLE IF NOT EXISTS dispatch_plan_items (
 );
 CREATE INDEX IF NOT EXISTS idx_dpitem_plan ON dispatch_plan_items(plan_id,seq);
 CREATE INDEX IF NOT EXISTS idx_dpitem_status ON dispatch_plan_items(status,kind);
+
+-- ---------------- 园区应急指挥：安全事件状态流转与跨域联动 ----------------
+-- 安全事件主单：发现上报 → 研判分级 → 封控 → 疏散 → 现场控制 → 复园 → 复盘结案（撤销/虚惊可在封控前结束）
+CREATE TABLE IF NOT EXISTS emergency_incidents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',          -- 事件号 YJ0001
+  type TEXT NOT NULL,                     -- fire/stampede/injury/ride/blackout/food/weather/lost/security
+  title TEXT NOT NULL,
+  desc TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'reported',-- reported/grading/locked/evacuating/contained/reviewing/reopened/cancelled/false_alarm
+  suggested_level INTEGER NOT NULL DEFAULT 1, -- 上报时建议等级（超时自动升级）
+  level INTEGER NOT NULL DEFAULT 0,       -- 正式定级 1 Ⅳ一般 / 2 Ⅲ较大 / 3 Ⅱ重大 / 4 Ⅰ特别重大（0=未定级）
+  location_type TEXT NOT NULL DEFAULT 'park', -- ride/zone/park
+  location_id INTEGER,
+  reporter_role TEXT NOT NULL DEFAULT 'guest', -- guest 游客报警 / security 安保 / ops 运营 / maintenance 维修 / service 客服
+  source TEXT NOT NULL DEFAULT 'manual',  -- manual 人工 / auto 系统监测
+  guest_name TEXT NOT NULL DEFAULT '',
+  guest_phone TEXT NOT NULL DEFAULT '',
+  commander_id INTEGER,                   -- 现场指挥（运营主管/值班经理）
+  affected_guests INTEGER NOT NULL DEFAULT 0,  -- 受影响游客（分级时核定）
+  injured_guests INTEGER NOT NULL DEFAULT 0,
+  evacuated_guests INTEGER NOT NULL DEFAULT 0, -- 已疏散游客（疏散任务完成回填）
+  comp_per_guest INTEGER NOT NULL DEFAULT 0,   -- 单人补偿建议（¥，按等级默认）
+  comp_guests INTEGER NOT NULL DEFAULT 0,      -- 已补偿人数（可分批）
+  comp_amount INTEGER NOT NULL DEFAULT 0,      -- 累计补偿金（¥）
+  rescue_cost INTEGER NOT NULL DEFAULT 0,      -- 救援处置成本（封控时按等级核定并结算）
+  refund_amount INTEGER NOT NULL DEFAULT 0,    -- 封控停运联动退款金额（在途预约）
+  refund_qty INTEGER NOT NULL DEFAULT 0,       -- 封控停运联动退款人数
+  rides_locked INTEGER NOT NULL DEFAULT 0,
+  escalations INTEGER NOT NULL DEFAULT 0,      -- 超时未定级自动升级次数
+  deadline_tick INTEGER NOT NULL DEFAULT 0,    -- 定级时限（tick=游戏小时），超时自动升级
+  event_id INTEGER,                            -- 联动事件中心 events.id
+  report_tick INTEGER NOT NULL DEFAULT 0,
+  report_day INTEGER NOT NULL DEFAULT 0,
+  grade_tick INTEGER NOT NULL DEFAULT 0,
+  lock_tick INTEGER NOT NULL DEFAULT 0,
+  evacuate_tick INTEGER NOT NULL DEFAULT 0,
+  contain_tick INTEGER NOT NULL DEFAULT 0,
+  reopen_tick INTEGER NOT NULL DEFAULT 0,
+  close_tick INTEGER NOT NULL DEFAULT 0,
+  close_day INTEGER NOT NULL DEFAULT 0,
+  rating INTEGER NOT NULL DEFAULT 0,           -- 复盘综合处置评价 1-5
+  false_alarm INTEGER NOT NULL DEFAULT 0,
+  review_cause TEXT NOT NULL DEFAULT '',       -- 复盘：事故原因
+  review_actions TEXT NOT NULL DEFAULT '',     -- 复盘：整改措施
+  review_note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_emerg_status ON emergency_incidents(status);
+CREATE INDEX IF NOT EXISTS idx_emerg_type ON emergency_incidents(type);
+CREATE INDEX IF NOT EXISTS idx_emerg_day ON emergency_incidents(report_day);
+
+-- 应急任务：封控布设/疏散引导/救援救助/抢修排险/清场清洁/复园巡验；派工后按游戏小时推进，岗位+排班门控
+CREATE TABLE IF NOT EXISTS emergency_tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',          -- 任务号 RW0001
+  incident_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,                     -- lockdown/evacuate/rescue/repair/clean/patrol
+  name TEXT NOT NULL,
+  roles TEXT NOT NULL DEFAULT '保安/安保', -- 可承接岗位（'/' 分隔，任一匹配）
+  gate TEXT NOT NULL DEFAULT 'contain',   -- contain 封控控制前置 / reopen 复园前置
+  status TEXT NOT NULL DEFAULT 'pending', -- pending/pool 待领 / processing 执行中 / done 完成 / cancelled 取消
+  progress REAL NOT NULL DEFAULT 0,
+  assignee_id INTEGER,
+  create_tick INTEGER NOT NULL DEFAULT 0,
+  create_day INTEGER NOT NULL DEFAULT 0,
+  start_tick INTEGER NOT NULL DEFAULT 0,
+  done_tick INTEGER NOT NULL DEFAULT 0,
+  done_day INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_etask_incident ON emergency_tasks(incident_id);
+CREATE INDEX IF NOT EXISTS idx_etask_status ON emergency_tasks(status,assignee_id);
+
+-- 事件处理时间线（上报/定级/封控/疏散/控制/补偿/复园/复盘/撤销/虚惊/任务创建派工完工）
+CREATE TABLE IF NOT EXISTS emergency_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  incident_id INTEGER NOT NULL,
+  tick INTEGER NOT NULL,
+  day INTEGER NOT NULL,
+  hour INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  staff_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_elog_incident ON emergency_logs(incident_id);
+
+-- 联动对象：停运设施 / 关闭区域（复园时恢复）/ 归集投诉（统一补偿结案）
+CREATE TABLE IF NOT EXISTS emergency_links (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  incident_id INTEGER NOT NULL,
+  ref_type TEXT NOT NULL,                 -- ride/zone/complaint
+  ref_id INTEGER NOT NULL,
+  meta TEXT NOT NULL DEFAULT '',
+  create_tick INTEGER NOT NULL DEFAULT 0,
+  create_day INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_elink_incident ON emergency_links(incident_id,ref_type);
 `)
 
 // ---------- 轻量列迁移（兼容老库） ----------
@@ -954,7 +1050,8 @@ function ensureScheduleBaseData() {
     ['dispatchCleanFlow', 700],
     ['dispatchNightGuardsPerZone', 0],  // 0=夜班不强制（按需动态补）；>0 时每 N 个区域至少 1 名夜勤保安
     ['groupDepositRate', 0.3],          // 团队订金比例
-    ['groupEnabled', 1]                 // 领队组团模块开关
+    ['groupEnabled', 1],                 // 领队组团模块开关
+    ['emergencyEnabled', 1]              // 园区应急指挥：系统监测随机安全事件开关
   ]) {
     if (!getSetting(k)) setSetting(k, String(v))
   }

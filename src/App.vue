@@ -14,6 +14,7 @@ import ReservationsView from '@/components/ReservationsView.vue'
 import GroupsView from '@/components/GroupsView.vue'
 import EventsView from '@/components/EventsView.vue'
 import ComplaintsView from '@/components/ComplaintsView.vue'
+import EmergencyView from '@/components/EmergencyView.vue'
 import ReportsView from '@/components/ReportsView.vue'
 
 const store = useParkStore()
@@ -33,6 +34,7 @@ const navs = [
   { k: 'groups', icon: '🧑‍✈️', label: '领队组团' },
   { k: 'events', icon: '🎆', label: '活动事件' },
   { k: 'complaints', icon: '🗂️', label: '投诉补救' },
+  { k: 'emergency', icon: '🚨', label: '应急指挥' },
   { k: 'reports', icon: '📈', label: '经营报表' }
 ]
 
@@ -68,6 +70,7 @@ onMounted(store.refresh)
           <h2>{{ navs.find(n => n.k === view)?.label }}</h2>
           <span class="halo" v-if="store.activeEvents.length">{{ store.activeEvents.length }} 个待处理事件</span>
           <span class="halo red" v-if="store.complaintStats.open">{{ store.complaintStats.open }} 条投诉待处置</span>
+          <span class="halo red" v-if="store.emergencyStats.open">🚨 {{ store.emergencyStats.open }} 起安全事件处置中<span v-if="store.emergencyStats.tasksPending">（{{ store.emergencyStats.tasksPending }} 项应急任务）</span></span>
           <span class="halo" v-if="store.maintenanceStats.queued">🛠️ {{ store.maintenanceStats.queued }} 张检修工单待接单</span>
           <span class="halo" v-if="store.schedulingStats.pendingRequests">🗓️ {{ store.schedulingStats.pendingRequests }} 个调班/加班待审批</span>
           <span class="halo red" v-if="store.schedulingStats.absentToday">❌ {{ store.schedulingStats.absentToday }} 人今日旷工</span>
@@ -100,6 +103,7 @@ onMounted(store.refresh)
         <GroupsView v-else-if="view === 'groups'" />
         <EventsView v-else-if="view === 'events'" />
         <ComplaintsView v-else-if="view === 'complaints'" />
+        <EmergencyView v-else-if="view === 'emergency'" />
         <ReportsView v-else />
       </section>
     </main>

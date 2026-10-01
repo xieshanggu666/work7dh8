@@ -55,6 +55,13 @@ function emptyGroupStats() {
   }
 }
 
+function emptyEmergencyStats() {
+  return {
+    open: 0, byStatus: {}, today: 0, closedToday: 0, rescueToday: 0, compToday: 0,
+    affectedActive: 0, evacuatedActive: 0, injuredActive: 0, tasksPending: 0, total: 0, avgRating: 0
+  }
+}
+
 export const useParkStore = defineStore('park', {
   state: () => ({
     data: null,
@@ -108,7 +115,11 @@ export const useParkStore = defineStore('park', {
     groupConfig: s => s.data?.groupConfig || { enabled: 1, depositRate: 0.3, minQty: 5, maxQty: 120, days: 3, entryHours: [9, 10, 11, 12, 13, 14, 15, 16, 17, 18], rideHours: [9, 10, 11, 12, 13, 14, 15, 16, 17] },
     // 统一客流预测与资源调度闭环
     closedLoop: s => s.data?.closedLoop || { days: [], forecast: { factor: 1, days: [] }, reconcile: { open: 0, blocks: 0 } },
-    reconcileList: s => s.data?.reconcileList || []
+    reconcileList: s => s.data?.reconcileList || [],
+    // 园区应急指挥
+    emergencies: s => s.data?.emergencies || [],
+    emergencyStats: s => s.data?.emergencyStats || emptyEmergencyStats(),
+    emergencyConfig: s => s.data?.emergencyConfig || { enabled: 1, compDefault: {}, rescueCost: {} }
   },
   actions: {
     async refresh() {
@@ -207,6 +218,19 @@ export const useParkStore = defineStore('park', {
     // 统一客流预测与资源调度闭环
     async closedLoop(horizon = 3) { return j('GET', `/closed-loop?horizon=${horizon}`) },
     runReconcile(autoHeal = true) { return this.api('POST', '/reconcile/run', { auto_heal: autoHeal }) },
-    ignoreReconcile(id) { return this.api('POST', `/reconcile/${id}/ignore`, {}) }
+    ignoreReconcile(id) { return this.api('POST', `/reconcile/${id}/ignore`, {}) },
+    // 园区应急指挥
+    async emergencyDetail(id) { return j('GET', `/emergencies/${id}`) },
+    reportEmergency(payload) { return this.api('POST', '/emergencies', payload) },
+    gradeEmergency(id, payload) { return this.api('POST', `/emergencies/${id}/grade`, payload) },
+    lockdownEmergency(id, payload) { return this.api('POST', `/emergencies/${id}/lockdown`, payload || {}) },
+    evacuateEmergency(id, payload) { return this.api('POST', `/emergencies/${id}/evacuate`, payload || {}) },
+    containEmergency(id, payload) { return this.api('POST', `/emergencies/${id}/contain`, payload || {}) },
+    reopenEmergency(id, payload) { return this.api('POST', `/emergencies/${id}/reopen`, payload || {}) },
+    compensateEmergency(id, payload) { return this.api('POST', `/emergencies/${id}/compensate`, payload) },
+    reviewEmergency(id, payload) { return this.api('POST', `/emergencies/${id}/review`, payload) },
+    cancelEmergency(id, payload) { return this.api('POST', `/emergencies/${id}/cancel`, payload) },
+    assignEmergencyTask(taskId, staff_id) { return this.api('POST', `/emergency-tasks/${taskId}/assign`, { staff_id }) },
+    saveEmergencyConfig(payload) { return this.api('POST', '/emergency-config', payload) }
   }
 })

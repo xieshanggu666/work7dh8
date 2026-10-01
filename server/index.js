@@ -43,6 +43,13 @@ import {
   runReconcile, listFindings, ignoreFinding, closedLoopOverview, reconcileStats
 } from './flow.js'
 import { initRideContext, upgradeRide } from './rides.js'
+import {
+  initEmergencyContext, reportIncident, gradeIncident, lockdownIncident,
+  startEvacuation, containIncident, reopenIncident, compensateIncident,
+  reviewIncident, cancelIncident, assignTask as assignEmergencyTask,
+  processEmergency, maybeSpawnIncident, openIncidentDrag,
+  listIncidents, incidentDetail, incidentStats, emergencyConfig, saveEmergencyConfig
+} from './emergency.js'
 
 const app = express()
 app.use(express.json())
@@ -142,6 +149,18 @@ initFlowContext({
 })
 // 启动即生成首版未来三天统一预测快照（闭环看板/排班需求画像的事实源）
 try { refreshForecastSnapshots() } catch (e) { console.error('[flow] 初始预测快照失败:', e) }
+
+// 园区应急指挥：时钟/现金/声誉/财务流水/设施停运联动（预约退款+团行程）/投诉建单/排班在岗校验/完工回写/动态调度
+// 依赖均已在此前完成初始化（预约/投诉/排班模块），可直接注入
+initEmergencyContext({
+  logFinance,
+  syncRideSlots: (ride) => syncRideSlots(ride),
+  createComplaint: (payload) => createComplaint(payload),
+  staffDutyState: (staffId) => staffDutyState(staffId),
+  onWorkComplete: (staffId, kind, meta) => writeWorkCompletion(staffId, kind, meta),
+  dispatchAfter: (reason) => maybeDispatchAfter(reason),
+  requestRepair: (rideId, note) => createMaintenanceOrder(rideId, 'emergency', note)
+})
 
 // ---------------- 分期贷款 ----------------
 const activeLoans = () => db.prepare("SELECT * FROM loans WHERE status='active' ORDER BY id").all()
@@ -375,9 +394,17 @@ function timeoutCloseComplaint(c) {
 function processComplaints() {
   const tick = state.tick()
   let repPenalty = 0
+  // 在处安全事件已归集的投诉：SLA 挂起（由应急指挥统一补偿结案），避免事件处置期间被按超时差评自动结案
+  const incidentLinked = new Set(
+    db.prepare(`SELECT el.ref_id FROM emergency_links el
+                JOIN emergency_incidents ei ON ei.id=el.incident_id
+                WHERE el.ref_type='complaint' AND ei.status IN ('reported','grading','locked','evacuating','contained','reviewing')`)
+      .all().map(r => r.ref_id)
+  )
   const open = db.prepare("SELECT * FROM complaints WHERE status IN ('open','processing','ready')").all()
   const upd = db.prepare('UPDATE complaints SET status=?, progress=?, deadline_tick=?, severity=?, escalated=?, escalations=?, resolved_tick=? WHERE id=?')
   for (const c of open) {
+    if (incidentLinked.has(c.id)) continue
     if (c.status === 'ready') {
       if (tick - (c.resolved_tick || c.tick) >= 6) {
         doResolveComplaint(c.id, 'apology', true)
@@ -647,6 +674,8 @@ function tick() {
   const satisfaction = computeSatisfaction(reservedEntry, entering)
   // 游客反馈：运营状况驱动随机投诉
   maybeSpawnComplaints(entering, satisfaction)
+  // 系统监测：低概率发现安全事件（健康度差/安全投诉/大客流/低满意度抬升概率）
+  try { maybeSpawnIncident({ entering, satisfaction }) } catch (e) { console.error('[emergency] 安全事件监测失败:', e) }
   const avgSpend = 40 + satisfaction / 5 + Math.random() * 15
   const spend = Math.round(entering * (avgSpend * 0.15 + ticket * 0.5)) // 门票为主的收入模型
 
@@ -743,6 +772,9 @@ function tick() {
   // 投诉处置：推进受理进度，超时自动升级 / 公开差评，返回本时段声誉扣分
   const complaintPenalty = processComplaints()
 
+  // 园区应急指挥：应急任务按在岗推进；未定级事件超时自动升级；系统监测随机生成安全事件
+  processEmergency()
+
   // 设施检修工单：维修员工接单后按游戏时间推进，离岗退回排队，完工恢复运营并结算费用
   processMaintenance()
 
@@ -809,6 +841,8 @@ function computeSatisfaction(reserved = 0, total = 0) {
   // 未结投诉持续拉低满意度（按严重度，上限 15），服务口碑小幅回流
   const drag = db.prepare("SELECT COALESCE(SUM(severity),0) s FROM complaints WHERE status IN ('open','processing','ready')").get().s
   sat -= Math.min(15, drag * 0.8)
+  // 在处安全事件按等级与阶段持续拉低满意度（封控疏散期权重更高，上限 14）
+  sat -= openIncidentDrag()
   sat += Math.max(-10, Math.min(10, state.wordOfMouth())) * 0.5
   sat += state.reputation() * 0.2
   // 分时预约核销占比越高，入园/排队越有序，满意度小幅加成（上限 +4）
@@ -898,6 +932,10 @@ app.get('/api/state', (req, res) => {
     events: db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT 40').all(),
     complaints: enrichComplaints(db.prepare('SELECT * FROM complaints ORDER BY id DESC LIMIT 60').all()),
     complaintStats: complaintStats(),
+    // 园区应急指挥
+    emergencies: listIncidents({ limit: 60 }),
+    emergencyStats: incidentStats(),
+    emergencyConfig: emergencyConfig(),
     wordOfMouth: state.wordOfMouth(),
     reservationStats: reservationStats(),
     entrySlots: listSlots({ scope: 'entry' }),
@@ -1298,6 +1336,130 @@ app.get('/api/complaints/:id', (req, res) => {
   if (!c) return res.status(404).json({ ok: false })
   const logs = db.prepare('SELECT * FROM complaint_logs WHERE complaint_id=? ORDER BY id').all(c.id)
   res.json({ complaint: enrichComplaints([c])[0], logs })
+})
+
+// ---- 园区应急指挥：安全事件发现/分级/封控/疏散/控制/补偿/复园/复盘 ----
+app.get('/api/emergencies', (req, res) => {
+  const q = req.query || {}
+  res.json({
+    list: listIncidents({ status: q.status && q.status !== 'all' ? q.status : null, limit: 200 }),
+    stats: incidentStats(),
+    config: emergencyConfig()
+  })
+})
+
+app.get('/api/emergencies/:id', (req, res) => {
+  const d = incidentDetail(num(req.params.id))
+  if (!d) return res.status(404).json({ ok: false, msg: '安全事件不存在' })
+  res.json(d)
+})
+
+// 多角色上报：游客一键报警/热线、安保巡逻、运营巡查、维修报事、客服上报
+app.post('/api/emergencies', (req, res) => {
+  const b = req.body || {}
+  const r = reportIncident({
+    type: String(b.type || ''),
+    locationType: String(b.location_type || ''),
+    locationId: num(b.location_id),
+    title: String(b.title || '').trim(),
+    desc: String(b.desc || '').trim(),
+    source: b.source === 'auto' ? 'auto' : 'manual',
+    reporterRole: String(b.reporter_role || 'guest'),
+    guestName: String(b.guest_name || ''),
+    guestPhone: String(b.guest_phone || ''),
+    staffId: b.staff_id ? num(b.staff_id) : null
+  })
+  res.status(r.ok ? 201 : 400).json({ ...r, reqId: req.reqId })
+})
+
+// 研判分级（运营主管/值班经理任总指挥，核定受影响/受伤人数与单人补偿建议）
+app.post('/api/emergencies/:id/grade', (req, res) => {
+  const b = req.body || {}
+  const r = gradeIncident(num(req.params.id), {
+    level: num(b.level),
+    commanderId: num(b.commander_id),
+    affectedGuests: b.affected_guests !== undefined && b.affected_guests !== null && b.affected_guests !== '' ? num(b.affected_guests) : undefined,
+    injuredGuests: b.injured_guests !== undefined && b.injured_guests !== null && b.injured_guests !== '' ? num(b.injured_guests) : undefined,
+    compPerGuest: b.comp_per_guest !== undefined && b.comp_per_guest !== null && b.comp_per_guest !== '' ? num(b.comp_per_guest) : undefined,
+    note: String(b.note || ''),
+    staffId: num(b.staff_id) || null
+  })
+  res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId })
+})
+
+// 封控：设施停运+预约退款/团行程重排、区域关闭、投诉归集、应急任务下达、救援成本结算
+app.post('/api/emergencies/:id/lockdown', (req, res) => {
+  const b = req.body || {}
+  const r = lockdownIncident(num(req.params.id), { note: String(b.note || ''), staffId: num(b.staff_id) || null })
+  res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId })
+})
+
+// 下达疏散广播（有疏散预案的事件）
+app.post('/api/emergencies/:id/evacuate', (req, res) => {
+  const b = req.body || {}
+  const r = startEvacuation(num(req.params.id), { note: String(b.note || ''), staffId: num(b.staff_id) || null })
+  res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId })
+})
+
+// 宣布现场控制（封控/救援/抢修任务须全部完成；自动生成复园巡验任务）
+app.post('/api/emergencies/:id/contain', (req, res) => {
+  const b = req.body || {}
+  const r = containIncident(num(req.params.id), { note: String(b.note || ''), staffId: num(b.staff_id) || null })
+  res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId })
+})
+
+// 复园：解除封控、恢复设施运营/重开时段、开放区域
+app.post('/api/emergencies/:id/reopen', (req, res) => {
+  const b = req.body || {}
+  const r = reopenIncident(num(req.params.id), { note: String(b.note || ''), staffId: num(b.staff_id) || null })
+  res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId })
+})
+
+// 游客统一补偿（可分批；财务扣减 + 关联投诉统一补偿结案 + 声誉回升）
+app.post('/api/emergencies/:id/compensate', (req, res) => {
+  const b = req.body || {}
+  const r = compensateIncident(num(req.params.id), {
+    qty: num(b.qty),
+    perGuest: num(b.per_guest),
+    staffId: num(b.staff_id) || null
+  })
+  res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId })
+})
+
+// 复盘结案：原因分析 + 整改措施 + 处置评价（声誉挽回、参与员工士气/工时回写）
+app.post('/api/emergencies/:id/review', (req, res) => {
+  const b = req.body || {}
+  const r = reviewIncident(num(req.params.id), {
+    rating: num(b.rating),
+    cause: String(b.cause || ''),
+    actions: String(b.actions || ''),
+    note: String(b.note || ''),
+    staffId: num(b.staff_id) || null
+  })
+  res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId })
+})
+
+// 撤销 / 虚惊结案（仅限封控前）
+app.post('/api/emergencies/:id/cancel', (req, res) => {
+  const b = req.body || {}
+  const r = cancelIncident(num(req.params.id), {
+    falseAlarm: b.false_alarm !== false,
+    note: String(b.note || ''),
+    staffId: num(b.staff_id) || null
+  })
+  res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId })
+})
+
+// 应急任务派工（责任岗位匹配 + 当日排班门控，到岗后自动推进）
+app.post('/api/emergency-tasks/:id/assign', (req, res) => {
+  const r = assignEmergencyTask(num(req.params.id), num(req.body?.staff_id))
+  res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId })
+})
+
+// 应急指挥运营配置：系统监测开关
+app.post('/api/emergency-config', (req, res) => {
+  const b = req.body || {}
+  res.json(saveEmergencyConfig({ enabled: b.enabled }))
 })
 
 // ---- 设施检修工单 ----
